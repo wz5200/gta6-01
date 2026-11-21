@@ -1,134 +1,118 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
-
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
+// Solara Bay — Street Kings. Boot, loop, scene presets for screenshots, save/load.
+// ?scene=chase | foot | mission | city | start  (auto-starts the game, real game code)
+// ?shot= is accepted as an alias for scene. Click / Enter starts from the title screen.
+import { createGame, update, respawn, saveGame, loadSave, applySave, addWanted } from './game.js';
+import { createRenderer } from './render.js';
+import { createInput } from './input.js';
+import { createAudio } from './audio.js';
+import { currentMission } from './missions.js';
 
 const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-
+const scene = params.get('scene') || params.get('shot') || '';
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
+const g = createGame(20261122);
 const renderer = createRenderer(canvas);
+const input = createInput(canvas);
+const audio = createAudio();
+window.__game = g; // play-test hook
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+function announce(m) { status.textContent = m; }
+
+function applyScene(name) {
+  const p = g.player;
+  if (name === 'chase') {
+    g.screen = 'play';
+    p.x = 1150; p.y = 420; p.cash = 2450; p.health = 82; p.wanted = 3;
+    const car = g.cars.find(c => c.id === 'p3') || g.cars[3];
+    car.traffic = false; car.parked = false; car.x = p.x; car.y = p.y; car.angle = 0; car.speed = 180;
+    p.inCar = car.id; p.angle = 0;
+    g.mission.index = 3; g.mission.active = true; g.mission.obj = 1;
+    g.mission.message = 'JOB 4 — HOT PURSUIT: Lose the cops and reach the Hideout in Palm Heights.'; g.mission.messageT = 99;
+    g.mission.banner = 'JOB 4 — HOT PURSUIT'; g.mission.bannerT = 3;
+    // police right behind
+    g.police.push({ kind: 'car', x: p.x - 260, y: p.y + 40, angle: 0, speed: 220, max: 330 });
+    g.police.push({ kind: 'car', x: p.x - 420, y: p.y - 30, angle: 0, speed: 210, max: 330 });
+    g.police.push({ kind: 'foot', x: p.x + 120, y: p.y + 90, angle: 0, speed: 0 });
+    g.camera.x = p.x; g.camera.y = p.y;
+  } else if (name === 'foot') {
+    g.screen = 'play';
+    p.x = 700; p.y = 420; p.cash = 850; p.health = 100; p.wanted = 0;
+    g.mission.index = 0; g.mission.active = false;
+    g.mission.message = 'Downtown, Solara Bay. Press M to start Job 1 with Rosa — or steal a car (E) and make your own trouble.'; g.mission.messageT = 99;
+    g.camera.x = p.x; g.camera.y = p.y;
+  } else if (name === 'mission') {
+    g.screen = 'play';
+    p.x = 2400; p.y = 1150; p.cash = 3100; p.health = 76; p.wanted = 2; p.ammo = 40;
+    g.mission.index = 4; g.mission.active = true; g.mission.obj = 0; g.mission.combatKills = 1;
+    // spawn the gang in front of the player
+    g.enemies = [
+      { x: 2520, y: 1080, angle: 0, health: 3, shootT: 2, alive: true, color: '#c22a2a', id: 'e0' },
+      { x: 2620, y: 1180, angle: 0, health: 2, shootT: 1, alive: true, color: '#c22a2a', id: 'e1' },
+      { x: 2480, y: 1260, angle: 0, health: 3, shootT: 3, alive: true, color: '#c22a2a', id: 'e2' },
+    ];
+    g.mission.message = 'JOB 5 — HARBOR AMBUSH: Defeat the Vipers gang at the Harbor (1/4). Click to shoot.'; g.mission.messageT = 99;
+    g.mission.banner = 'JOB 5 — HARBOR AMBUSH'; g.mission.bannerT = 3;
+    g.camera.x = p.x; g.camera.y = p.y;
+  } else if (name === 'city') {
+    g.screen = 'play';
+    p.x = 1600; p.y = 1200; p.cash = 1200; p.health = 100; p.wanted = 1;
+    g.mission.index = 1; g.mission.active = true; g.mission.obj = 0;
+    g.mission.message = 'JOB 2 — BEACH RUN: Collect the briefcase on Solara Beach, then deliver it to the Marina.'; g.mission.messageT = 99;
+    g.camera.x = p.x; g.camera.y = p.y;
+  } else if (name === 'start') {
+    g.screen = 'title';
   }
+  if (name) window.__shotReady = false;
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
+if (scene) applyScene(scene);
+
+// Title-screen click / Enter handling is inside the loop (needs canvas coords).
+let last = performance.now(), acc = 0;
+const STEP = 1 / 60, MAX_FRAME = 0.25;
+let frames = 0;
+
+function startGame() {
+  g.screen = 'play'; audio.unlock(); announce('Playing Solara Bay. Press M for your first job.');
+  if (!g.mission.active && currentMission(g.mission)) { /* wait for M */ }
 }
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
-  }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+function frame(now) {
   requestAnimationFrame(frame);
+  const dt = Math.min((now - last) / 1000, MAX_FRAME); last = now;
+  // global keys
+  if (input.pressedP) {
+    input.pressedP = false;
+    if (g.screen === 'play') { g.screen = 'pause'; announce('Paused.'); }
+    else if (g.screen === 'pause') { g.screen = 'play'; announce('Playing.'); }
+  }
+  if (input.pressedF) { input.pressedF = false; if (saveGame(g)) { g.mission.message = 'Game saved.'; g.mission.messageT = 3; } }
+  if (input.pressedL) { input.pressedL = false; const s = loadSave(); if (s && applySave(g, s)) { g.screen = 'play'; } else { g.mission.message = 'No save found yet — press F to save.'; g.mission.messageT = 3; } }
+  if (g.screen === 'title') {
+    if (input.pressedEnter || input.clicked) { input.clicked = false; input.pressedEnter = false; startGame(); }
+    else {
+      // title click on the START button
+      if (input.clicked) { input.clicked = false; startGame(); }
+    }
+    // idle world behind title: let traffic drift
+    acc += dt; while (acc >= STEP) { update(g, STEP, { up: false, down: false, left: false, right: false, run: false, clicked: false, mouseX: 0, mouseY: 0, viewW: 1280, viewH: 720 }, null); acc -= STEP; if (g.screen !== 'title') break; }
+    // keep title screen (update may have changed wanted etc. — restore)
+    if (g.screen === 'play' && !scene) { /* started via update path? no */ }
+    g.screen = 'title';
+  } else if (g.screen === 'play') {
+    acc += dt;
+    while (acc >= STEP) { update(g, STEP, input, audio); acc -= STEP; if (g.screen !== 'play') { acc = 0; break; } }
+  } else if (g.screen === 'busted' || g.screen === 'wasted' || g.screen === 'complete') {
+    if (input.pressedEnter || input.clicked) { input.clicked = false; input.pressedEnter = false; if (g.screen === 'complete') { g.screen = 'play'; g.mission.done = false; } else respawn(g); }
+  }
+  // debug keys: 1-4 jump to scenes (also useful for screenshots)
+  // (handled via ?scene= for determinism; keys kept minimal)
+  const w = canvas.clientWidth || 1280, h = canvas.clientHeight || 720;
+  input.viewW = w; input.viewH = h;
+  renderer.draw(g, w, h);
+  frames++;
+  if (scene && frames > 45) window.__shotReady = true;
+  if (!scene && frames === 30) window.__shotReady = true;
 }
-
-if (shot) runShot(shot);
-else runGame();
+announce('Solara Bay Street Kings. Press Enter or click to start.');
+requestAnimationFrame(frame);
